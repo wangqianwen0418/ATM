@@ -10,6 +10,7 @@ import time
 import traceback
 import warnings
 import csv
+import os
 
 from builtins import object, str
 from collections import defaultdict
@@ -469,6 +470,10 @@ def work(db, datarun_ids=None, save_files=False, choose_randomly=True,
     trialID = 0
     current_runID = 0
     log_file = None
+    # viz folder save the file for visualization
+    if not os.path.exists('./viz'):
+        os.makedirs("./viz")
+
     # main loop
     while True:
         # get all pending and running dataruns, or all pending/running dataruns

@@ -10,11 +10,12 @@ models/
 metrics/
 logs/
 
+### include config files, changed by qianwen 2018/06/08
 # ignore configuration files except templates
-*.yaml
-!atm/config/test/*.yaml
-!atm/config/templates/*.yaml
-atm/config/templates/aws.yaml
+# *.yaml
+# !atm/config/test/*.yaml
+# !atm/config/templates/*.yaml
+# atm/config/templates/aws.yaml
 
 # ignore virtualenv and other binary files
 atm-env/*
