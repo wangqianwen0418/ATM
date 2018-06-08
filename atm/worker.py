@@ -9,6 +9,8 @@ import random
 import time
 import traceback
 import warnings
+import csv
+
 from builtins import object, str
 from collections import defaultdict
 from operator import attrgetter
@@ -22,6 +24,8 @@ from .constants import *
 from .database import ClassifierStatus, db_session
 from .model import Model
 from .utilities import *
+
+
 
 # shhh
 warnings.filterwarnings('ignore')
@@ -43,7 +47,7 @@ class ClassifierError(Exception):
 
 
 class Worker(object):
-    def __init__(self, database, datarun, save_files=True, cloud_mode=False,
+    def __init__(self, database, datarun, trialID, spamwriter, save_files=True, cloud_mode=False,
                  aws_config=None, log_config=None, public_ip='localhost'):
         """
         database: Database object with connection information
@@ -58,6 +62,8 @@ class Worker(object):
         self.cloud_mode = cloud_mode
         self.aws_config = aws_config
         self.public_ip = public_ip
+        self.trialID = trialID
+        self.spamwriter = spamwriter
 
         log_config = log_config or LogConfig()
         self.model_dir = log_config.model_dir
@@ -72,6 +78,9 @@ class Worker(object):
         # load the Selector and Tuner classes specified by our datarun
         self.load_selector()
         self.load_tuner()
+
+        # csv to save files for visualizing
+        
 
     def load_selector(self):
         """
@@ -215,28 +224,31 @@ class Worker(object):
                                    test_path=test_path)
         target = self.datarun.score_target
 
-        def metric_string(model):
-            if 'cv' in target or 'mu_sigma' in target:
-                return '%.3f +- %.3f' % (model.cv_judgment_metric,
-                                         2 * model.cv_judgment_metric_stdev)
-            else:
-                return '%.3f' % model.test_judgment_metric
-
         logger.info('Judgment metric (%s, %s): %s' % (self.datarun.metric,
                                                       target[:-len('_judgment_metric')],
-                                                      metric_string(model)))
+                                                      self.metric_string(model)))
 
         old_best = self.db.get_best_classifier(datarun_id=self.datarun.id,
                                                score_target=target)
         if old_best is not None:
             if getattr(model, target) > getattr(old_best, target):
                 logger.info('New best score! Previous best (classifier %s): %s'
-                            % (old_best.id, metric_string(old_best)))
+                            % (old_best.id, self.metric_string(old_best)))
             else:
                 logger.info('Best so far (classifier %s): %s' % (old_best.id,
-                                                                 metric_string(old_best)))
+                                                                 self.metric_string(old_best)))
 
         return model, metrics
+
+    def metric_string(self, model):
+        target = self.datarun.score_target
+        if 'cv' in target or 'mu_sigma' in target:
+            return '%.3f +- %.3f' % (model.cv_judgment_metric,
+                                        2 * model.cv_judgment_metric_stdev)
+        else:
+            return '%.3f' % model.test_judgment_metric
+
+        
 
     def save_classifier(self, classifier_id, model, metrics):
         """
@@ -357,6 +369,8 @@ class Worker(object):
             # marked the run as done successfully
             self.db.mark_datarun_complete(self.datarun.id)
             logger.warning('Datarun %d has ended.' % self.datarun.id)
+
+            # self.log_file.close()
             return
 
         try:
@@ -383,9 +397,13 @@ class Worker(object):
                            % hyperpartition.id)
             return
 
+
         param_info = 'Chose parameters for method "%s":' % hyperpartition.method
+        param_arr = []
+        
         for k in sorted(params.keys()):
             param_info += '\n\t%s = %s' % (k, params[k])
+            param_arr.append( '%s = %s' % (k, params[k]) )
         logger.info(param_info)
 
         logger.debug('Creating classifier...')
@@ -405,7 +423,20 @@ class Worker(object):
             logger.error(msg)
             self.db.mark_classifier_errored(classifier.id, error_message=msg)
             raise ClassifierError()
-
+        
+        self.spamwriter.writerow(
+            [
+                self.trialID, 
+                hyperpartition.method, 
+                '; '.join(param_arr), 
+                '({}, {})'.format(
+                    self.datarun.metric, 
+                    self.datarun.score_target[:-len('_judgment_metric')]
+                    ),
+                self.metric_string(model)
+            ]
+        )
+                                                      
 
 def work(db, datarun_ids=None, save_files=False, choose_randomly=True,
          cloud_mode=False, aws_config=None, log_config=None, total_time=None,
@@ -434,12 +465,18 @@ def work(db, datarun_ids=None, save_files=False, choose_randomly=True,
     start_time = datetime.datetime.now()
     public_ip = get_public_ip()
 
+
+    trialID = 0
+    current_runID = 0
+    log_file = None
     # main loop
     while True:
         # get all pending and running dataruns, or all pending/running dataruns
         # from the list we were given
         dataruns = db.get_dataruns(include_ids=datarun_ids,
                                    ignore_complete=True)
+        
+        
         if not dataruns:
             if wait:
                 logger.warning('No dataruns found. Sleeping %d seconds and trying again.'
@@ -448,6 +485,8 @@ def work(db, datarun_ids=None, save_files=False, choose_randomly=True,
                 continue
             else:
                 logger.warning('No dataruns found. Exiting.')
+                if log_file:
+                    log_file.close()
                 break
 
         max_priority = max([r.priority for r in dataruns])
@@ -461,12 +500,24 @@ def work(db, datarun_ids=None, save_files=False, choose_randomly=True,
 
         # say we've started working on this datarun, if we haven't already
         db.mark_datarun_running(run.id)
-
         logger.info('Computing on datarun %d' % run.id)
+
+        if current_runID != run.id:
+            if log_file: # close an old log file if existing
+                log_file.close()
+            current_runID = run.id
+            # create a new log file and set trial ID to 0
+            trialID = 0
+            log_file = open("viz/datarun{}_grid.csv".format( current_runID ), "w")
+            spamwriter = csv.writer(log_file)
+            spamwriter.writerow(["trail ID", "method", "parameters", "metrics", "performance"])
+
         # actual work happens here
-        worker = Worker(db, run, save_files=save_files,
+        
+        worker = Worker(db, run, trialID, spamwriter, save_files=save_files, 
                         cloud_mode=cloud_mode, aws_config=aws_config,
                         log_config=log_config, public_ip=public_ip)
+        trialID += 1
         try:
             worker.run_classifier()
         except ClassifierError:
